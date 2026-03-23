@@ -1,119 +1,224 @@
 package main
 
+// Deep Edge ISP Intelligence Tool v3 (Fyne GUI + ISP Engine)
+
 import (
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/jung-kurt/gofpdf"
 )
 
-// GeoData matches the IP-API response
-type GeoData struct {
-	Status  string `json:"status"`
-	Isp     string `json:"isp"`
-	Org     string `json:"org"`
-	As      string `json:"as"`
-	City    string `json:"city"`
-	Country string `json:"country"`
+// -------------------- DATA STRUCTURES --------------------
+
+type Result struct {
+	Domain string
+	IPs    []string
+	ASN    string
+	Org    string
+	CDN    string
 }
+
+// -------------------- MAIN --------------------
 
 func main() {
 	myApp := app.New()
-	window := myApp.NewWindow("Deep Edge Diagnostic Tool v1.0")
-	window.Resize(fyne.NewSize(600, 500))
+	window := myApp.NewWindow("Deep Edge ISP Tool v3")
+	window.Resize(fyne.NewSize(700, 600))
 
-	input := widget.NewEntry()
-	input.SetPlaceHolder("Enter domain (e.g., google.com)")
+	input := widget.NewMultiLineEntry()
+	input.SetPlaceHolder("Enter domains (one per line)")
 
 	output := widget.NewMultiLineEntry()
-	output.Disable() // This replaces SetReadOnly
+	output.Disable()
 	output.Wrapping = fyne.TextWrapWord
 
-	statusLabel := widget.NewLabel("Ready")
+	status := widget.NewLabel("Ready")
 
-	runDiagnostic := func() {
-		domain := strings.TrimSpace(input.Text)
-		if domain == "" {
-			statusLabel.SetText("Please enter a domain!")
-			return
+	run := func() {
+		domains := strings.Split(input.Text, "\n")
+		var clean []string
+		for _, d := range domains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				clean = append(clean, d)
+			}
 		}
 
-		statusLabel.SetText("Diagnosing: " + domain + "...")
-		output.SetText("Working...")
+		status.SetText("Running analysis...")
+		results := runBatch(clean)
+		agg := aggregateASN(results)
+
+		generatePDF(results, agg)
 
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("--- DIAGNOSTIC FOR: %s ---\n\n", domain))
-
-		// 1. IP & ASN Info
-		ips, err := net.LookupIP(domain)
-		if err != nil || len(ips) == 0 {
-			sb.WriteString("[!] Failed to resolve IP.\n")
-		} else {
-			targetIP := ips[0].String()
-			sb.WriteString(fmt.Sprintf("[*] IPv4 Address: %s\n", targetIP))
-
-			client := &http.Client{Timeout: 3 * time.Second}
-			apiResp, err := client.Get("http://ip-api.com/json/" + targetIP)
-			if err == nil {
-				var geo GeoData
-				json.NewDecoder(apiResp.Body).Decode(&geo)
-				apiResp.Body.Close()
-				if geo.Status == "success" {
-					sb.WriteString(fmt.Sprintf("    ISP: %s\n", geo.Isp))
-					sb.WriteString(fmt.Sprintf("    Org: %s\n", geo.Org))
-					sb.WriteString(fmt.Sprintf("    ASN: %s\n", geo.As))
-					sb.WriteString(fmt.Sprintf("    Location: %s, %s\n", geo.City, geo.Country))
-				}
-			}
-		}
-
-		// 2. Nameservers
-		nsRecords, _ := net.LookupNS(domain)
-		if len(nsRecords) > 0 {
-			sb.WriteString("\n[*] Nameservers:\n")
-			for _, r := range nsRecords {
-				sb.WriteString(fmt.Sprintf("  - %s\n", r.Host))
-			}
-		}
-
-		// 3. HTTP Headers
-		sb.WriteString("\n[*] Edge & Header Inspection:\n")
-		headerClient := &http.Client{Timeout: 5 * time.Second}
-		req, _ := http.NewRequest("HEAD", "https://"+domain, nil)
-		hResp, err := headerClient.Do(req)
-
-		if err != nil {
-			sb.WriteString("[!] HTTP Request failed (HTTPS may be blocked).\n")
-		} else {
-			defer hResp.Body.Close()
-			sb.WriteString(fmt.Sprintf("  Server Type: %s\n", hResp.Header.Get("Server")))
-
-			if hResp.Header.Get("CF-Ray") != "" {
-				sb.WriteString("  [!] CLOUDFLARE DETECTED\n")
-				sb.WriteString(fmt.Sprintf("  CF-Ray ID: %s\n", hResp.Header.Get("CF-Ray")))
-			} else if hResp.Header.Get("X-Amz-Cf-Id") != "" {
-				sb.WriteString("  [!] AWS CLOUDFRONT DETECTED\n")
-			}
+		for _, r := range results {
+			sb.WriteString(fmt.Sprintf("%s | %s | %s | %s\n", r.Domain, r.ASN, r.Org, r.CDN))
 		}
 
 		output.SetText(sb.String())
-		statusLabel.SetText("Done.")
+		status.SetText("Done. PDF generated.")
 	}
 
-	form := container.NewVBox(
-		widget.NewLabel("Target Domain:"),
+	ui := container.NewVBox(
+		widget.NewLabel("Domains:"),
 		input,
-		widget.NewButton("Run Diagnostic", runDiagnostic),
-		statusLabel,
+		widget.NewButton("Run Analysis + Generate PDF", run),
+		status,
 	)
 
-	window.SetContent(container.NewBorder(form, nil, nil, nil, container.NewScroll(output)))
+	window.SetContent(container.NewBorder(ui, nil, nil, nil, container.NewScroll(output)))
 	window.ShowAndRun()
+}
+
+// -------------------- BATCH --------------------
+
+func runBatch(domains []string) []Result {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var results []Result
+
+	for _, d := range domains {
+		wg.Add(1)
+		go func(domain string) {
+			defer wg.Done()
+			res := analyzeDomain(domain)
+
+			mu.Lock()
+			results = append(results, res)
+			mu.Unlock()
+		}(d)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// -------------------- ANALYSIS --------------------
+
+func analyzeDomain(domain string) Result {
+	res := Result{Domain: domain}
+
+	ips, _ := net.LookupIP(domain)
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			res.IPs = append(res.IPs, ip.String())
+		}
+	}
+
+	if len(res.IPs) > 0 {
+		asn, org := lookupASN(res.IPs[0])
+		res.ASN = asn
+		res.Org = org
+		res.CDN = detectCDN(domain)
+	}
+
+	return res
+}
+
+// -------------------- ASN --------------------
+
+func lookupASN(ip string) (string, string) {
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://ip-api.com/json/" + ip)
+	if err != nil {
+		return "Unknown", "Unknown"
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		As  string `json:"as"`
+		Org string `json:"org"`
+	}
+
+	json.NewDecoder(resp.Body).Decode(&data)
+	return data.As, data.Org
+}
+
+// -------------------- CDN --------------------
+
+func detectCDN(domain string) string {
+	client := http.Client{Timeout: 5 * time.Second}
+	req, _ := http.NewRequest("HEAD", "https://"+domain, nil)
+	resp, err := client.Do(req)
+
+	if err != nil {
+		return "Unknown"
+	}
+	defer resp.Body.Close()
+
+	headers := resp.Header
+
+	switch {
+	case headers.Get("CF-Ray") != "":
+		return "Cloudflare"
+	case headers.Get("X-Amz-Cf-Id") != "":
+		return "AWS CloudFront"
+	case strings.Contains(headers.Get("Server"), "Google"):
+		return "Google Cloud"
+	default:
+		return "Unknown"
+	}
+}
+
+// -------------------- AGG --------------------
+
+func aggregateASN(results []Result) map[string]int {
+	agg := make(map[string]int)
+	for _, r := range results {
+		agg[r.ASN]++
+	}
+	return agg
+}
+
+// -------------------- PDF --------------------
+
+func generatePDF(results []Result, agg map[string]int) {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	pdf.AddPage()
+
+	pdf.SetFont("Arial", "B", 16)
+	pdf.Cell(40, 10, "Deep Edge ISP Report")
+
+	pdf.Ln(10)
+	pdf.SetFont("Arial", "", 12)
+	pdf.Cell(40, 10, fmt.Sprintf("Domains: %d", len(results)))
+
+	pdf.Ln(10)
+	pdf.Cell(40, 10, "ASN Summary:")
+	pdf.Ln(8)
+
+	for asn, count := range agg {
+		pdf.Cell(40, 8, fmt.Sprintf("%s -> %d", asn, count))
+		pdf.Ln(6)
+	}
+
+	pdf.AddPage()
+	pdf.Cell(40, 10, "Details:")
+	pdf.Ln(10)
+
+	for _, r := range results {
+		pdf.Cell(40, 8, "Domain: "+r.Domain)
+		pdf.Ln(6)
+		pdf.Cell(40, 8, "ASN: "+r.ASN)
+		pdf.Ln(6)
+		pdf.Cell(40, 8, "Org: "+r.Org)
+		pdf.Ln(6)
+		pdf.Cell(40, 8, "CDN: "+r.CDN)
+		pdf.Ln(6)
+		pdf.Cell(40, 8, "IPs: "+strings.Join(r.IPs, ", "))
+		pdf.Ln(10)
+	}
+
+	pdf.OutputFileAndClose("report.pdf")
 }

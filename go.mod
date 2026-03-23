@@ -2,7 +2,10 @@ module webDIG
 
 go 1.22.2
 
-require fyne.io/fyne/v2 v2.7.3
+require (
+	fyne.io/fyne/v2 v2.7.3
+	github.com/jung-kurt/gofpdf v1.16.2
+)
 
 require (
 	fyne.io/systray v1.12.0 // indirect
