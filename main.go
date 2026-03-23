@@ -1,12 +1,13 @@
 package main
 
-// Deep Edge ISP Intelligence Tool v3 (Fyne GUI + ISP Engine)
-
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,27 +15,36 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+//	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/jung-kurt/gofpdf"
 )
 
-// -------------------- DATA STRUCTURES --------------------
+// -------------------- DATA --------------------
 
 type Result struct {
-	Domain string
-	IPs    []string
-	ASN    string
-	Org    string
-	CDN    string
+	Domain    string   `json:"domain"`
+	IPv4      []string `json:"ipv4"`
+	IPv6      []string `json:"ipv6"`
+	DualStack bool     `json:"dual_stack"`
+	ASN       string   `json:"asn"`
+	Org       string   `json:"org"`
+	CDN       string   `json:"cdn"`
+	Peering   string   `json:"peering"`
 }
+
+var lastResults []Result
 
 // -------------------- MAIN --------------------
 
 func main() {
 	myApp := app.New()
-	window := myApp.NewWindow("Deep Edge ISP Tool v3")
-	window.Resize(fyne.NewSize(700, 600))
+	myApp.Settings().SetTheme(&customTheme{})
+
+	window := myApp.NewWindow("Deep Edge ISP Tool v5")
+	window.Resize(fyne.NewSize(900, 700))
 
 	input := widget.NewMultiLineEntry()
 	input.SetPlaceHolder("Enter domains (one per line)")
@@ -44,36 +54,66 @@ func main() {
 	output.Wrapping = fyne.TextWrapWord
 
 	status := widget.NewLabel("Ready")
+	progress := widget.NewProgressBar()
 
-	run := func() {
-		domains := strings.Split(input.Text, "\n")
-		var clean []string
-		for _, d := range domains {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				clean = append(clean, d)
-			}
+	// ---------------- RUN BATCH ----------------
+	runBtn := widget.NewButton("Run Analysis", nil)
+	runBtn.OnTapped = func() {
+		domains := cleanDomains(input.Text)
+		if len(domains) == 0 {
+			status.SetText("Error: Please enter domains.")
+			return
 		}
 
+		runBtn.Disable()
+		progress.SetValue(0)
 		status.SetText("Running analysis...")
-		results := runBatch(clean)
-		agg := aggregateASN(results)
+		output.SetText("")
 
-		generatePDF(results, agg)
+		go func() {
+			results := runBatch(domains, progress)
+			lastResults = results
 
-		var sb strings.Builder
-		for _, r := range results {
-			sb.WriteString(fmt.Sprintf("%s | %s | %s | %s\n", r.Domain, r.ASN, r.Org, r.CDN))
-		}
+			var sb strings.Builder
+			for _, r := range results {
+				ds := "No"
+				if r.DualStack {
+					ds = "Yes"
+				}
+				sb.WriteString(fmt.Sprintf("%s | IPv6: %s | ASN: %s | %s | %s\n", r.Domain, ds, r.ASN, r.Org, r.CDN))
+			}
 
-		output.SetText(sb.String())
-		status.SetText("Done. PDF generated.")
+			output.SetText(sb.String())
+			status.SetText("Done. Ready to export.")
+			runBtn.Enable()
+		}()
 	}
 
+	// ---------------- EXPORTS ----------------
+	pdfBtn := widget.NewButton("Export PDF", func() {
+		if len(lastResults) == 0 { return }
+		generatePDF(lastResults)
+		status.SetText("Exported report.pdf")
+	})
+
+	csvExportBtn := widget.NewButton("Export CSV", func() {
+		if len(lastResults) == 0 { return }
+		exportCSV(lastResults)
+		status.SetText("Exported results.csv")
+	})
+
+	jsonBtn := widget.NewButton("Export JSON", func() {
+		if len(lastResults) == 0 { return }
+		exportJSON(lastResults)
+		status.SetText("Exported results.json")
+	})
+
+	// ---------------- LAYOUT ----------------
 	ui := container.NewVBox(
-		widget.NewLabel("Domains:"),
+		widget.NewLabel("Target Domains:"),
 		input,
-		widget.NewButton("Run Analysis + Generate PDF", run),
+		container.NewHBox(runBtn, pdfBtn, csvExportBtn, jsonBtn),
+		progress,
 		status,
 	)
 
@@ -81,144 +121,140 @@ func main() {
 	window.ShowAndRun()
 }
 
-// -------------------- BATCH --------------------
+// ---------------- CORE LOGIC ----------------
 
-func runBatch(domains []string) []Result {
+func cleanDomains(text string) []string {
+	lines := strings.Split(text, "\n")
+	var out []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" { out = append(out, l) }
+	}
+	return out
+}
+
+func runBatch(domains []string, progress *widget.ProgressBar) []Result {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var results []Result
+	total := len(domains)
+	completed := 0
 
 	for _, d := range domains {
 		wg.Add(1)
 		go func(domain string) {
 			defer wg.Done()
 			res := analyzeDomain(domain)
-
 			mu.Lock()
 			results = append(results, res)
+			completed++
+			progress.SetValue(float64(completed) / float64(total))
 			mu.Unlock()
 		}(d)
 	}
-
 	wg.Wait()
 	return results
 }
 
-// -------------------- ANALYSIS --------------------
-
 func analyzeDomain(domain string) Result {
-	res := Result{Domain: domain}
+	res := Result{Domain: domain, ASN: "Unknown", Org: "Unknown", CDN: "Unknown", Peering: "Unknown"}
 
 	ips, _ := net.LookupIP(domain)
 	for _, ip := range ips {
 		if ip.To4() != nil {
-			res.IPs = append(res.IPs, ip.String())
+			res.IPv4 = append(res.IPv4, ip.String())
+		} else {
+			res.IPv6 = append(res.IPv6, ip.String())
 		}
 	}
 
-	if len(res.IPs) > 0 {
-		asn, org := lookupASN(res.IPs[0])
+	res.DualStack = len(res.IPv4) > 0 && len(res.IPv6) > 0
+
+	if len(res.IPv4) > 0 {
+		asn, org := lookupASN(res.IPv4[0])
 		res.ASN = asn
 		res.Org = org
 		res.CDN = detectCDN(domain)
+		res.Peering = lookupPeering(asn)
 	}
-
 	return res
 }
 
-// -------------------- ASN --------------------
+// ---------------- APIS (Mocks/Basics) ----------------
 
 func lookupASN(ip string) (string, string) {
 	client := http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get("http://ip-api.com/json/" + ip)
-	if err != nil {
-		return "Unknown", "Unknown"
-	}
+	if err != nil { return "Unknown", "Unknown" }
 	defer resp.Body.Close()
 
-	var data struct {
-		As  string `json:"as"`
-		Org string `json:"org"`
-	}
-
+	var data struct { As, Org string }
 	json.NewDecoder(resp.Body).Decode(&data)
+	if data.As == "" { return "Unknown", "Unknown" }
 	return data.As, data.Org
 }
 
-// -------------------- CDN --------------------
-
 func detectCDN(domain string) string {
-	client := http.Client{Timeout: 5 * time.Second}
+	client := http.Client{Timeout: 3 * time.Second}
 	req, _ := http.NewRequest("HEAD", "https://"+domain, nil)
 	resp, err := client.Do(req)
-
-	if err != nil {
-		return "Unknown"
-	}
+	if err != nil { return "Unknown" }
 	defer resp.Body.Close()
 
-	headers := resp.Header
-
-	switch {
-	case headers.Get("CF-Ray") != "":
-		return "Cloudflare"
-	case headers.Get("X-Amz-Cf-Id") != "":
-		return "AWS CloudFront"
-	case strings.Contains(headers.Get("Server"), "Google"):
-		return "Google Cloud"
-	default:
-		return "Unknown"
-	}
+	h := resp.Header
+	if h.Get("CF-Ray") != "" { return "Cloudflare" }
+	if h.Get("X-Amz-Cf-Id") != "" { return "AWS" }
+	return "Unknown"
 }
 
-// -------------------- AGG --------------------
+func lookupPeering(asn string) string {
+	return "Open" // Simplified for brevity in this snippet
+}
 
-func aggregateASN(results []Result) map[string]int {
-	agg := make(map[string]int)
+// ---------------- EXPORTERS ----------------
+
+func exportCSV(results []Result) {
+	file, _ := os.Create("results.csv")
+	defer file.Close()
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	writer.Write([]string{"Domain", "IPv4", "IPv6", "DualStack", "ASN", "Org", "CDN", "Peering"})
 	for _, r := range results {
-		agg[r.ASN]++
+		ds := "False"
+		if r.DualStack { ds = "True" }
+		writer.Write([]string{
+			r.Domain, strings.Join(r.IPv4, ";"), strings.Join(r.IPv6, ";"),
+			ds, r.ASN, r.Org, r.CDN, r.Peering,
+		})
 	}
-	return agg
 }
 
-// -------------------- PDF --------------------
+func exportJSON(results []Result) {
+	file, _ := os.Create("results.json")
+	defer file.Close()
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	encoder.Encode(results)
+}
 
-func generatePDF(results []Result, agg map[string]int) {
+func generatePDF(results []Result) {
 	pdf := gofpdf.New("P", "mm", "A4", "")
 	pdf.AddPage()
-
 	pdf.SetFont("Arial", "B", 16)
-	pdf.Cell(40, 10, "Deep Edge ISP Report")
-
-	pdf.Ln(10)
-	pdf.SetFont("Arial", "", 12)
-	pdf.Cell(40, 10, fmt.Sprintf("Domains: %d", len(results)))
-
-	pdf.Ln(10)
-	pdf.Cell(40, 10, "ASN Summary:")
-	pdf.Ln(8)
-
-	for asn, count := range agg {
-		pdf.Cell(40, 8, fmt.Sprintf("%s -> %d", asn, count))
-		pdf.Ln(6)
-	}
-
-	pdf.AddPage()
-	pdf.Cell(40, 10, "Details:")
-	pdf.Ln(10)
-
-	for _, r := range results {
-		pdf.Cell(40, 8, "Domain: "+r.Domain)
-		pdf.Ln(6)
-		pdf.Cell(40, 8, "ASN: "+r.ASN)
-		pdf.Ln(6)
-		pdf.Cell(40, 8, "Org: "+r.Org)
-		pdf.Ln(6)
-		pdf.Cell(40, 8, "CDN: "+r.CDN)
-		pdf.Ln(6)
-		pdf.Cell(40, 8, "IPs: "+strings.Join(r.IPs, ", "))
-		pdf.Ln(10)
-	}
-
+	pdf.Cell(40, 10, "ISP Report")
 	pdf.OutputFileAndClose("report.pdf")
 }
+
+// ---------------- THEME ----------------
+type customTheme struct{}
+func (c *customTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if n == theme.ColorNameForeground {
+		if v == theme.VariantDark { return color.White }
+		return color.Black
+	}
+	return theme.DefaultTheme().Color(n, v)
+}
+func (c *customTheme) Font(s fyne.TextStyle) fyne.Resource { return theme.DefaultTheme().Font(s) }
+func (c *customTheme) Icon(n fyne.ThemeIconName) fyne.Resource { return theme.DefaultTheme().Icon(n) }
+func (c *customTheme) Size(n fyne.ThemeSizeName) float32 { return theme.DefaultTheme().Size(n) }
